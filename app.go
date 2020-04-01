@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,9 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -32,12 +35,14 @@ var cert string
 var key string
 var port string
 var name string
+var waitPeriodSeconds int
 
 func init() {
 	flag.StringVar(&cert, "cert", "", "give me a certificate")
 	flag.StringVar(&key, "key", "", "give me a key")
 	flag.StringVar(&port, "port", "80", "give me a port number")
 	flag.StringVar(&name, "name", os.Getenv("WHOAMI_NAME"), "give me a name")
+	flag.IntVar(&waitPeriodSeconds, "wait-period-seconds", 5, "how long to keep handling connections before closing server")
 }
 
 var upgrader = websocket.Upgrader{
@@ -48,19 +53,43 @@ var upgrader = websocket.Upgrader{
 func main() {
 	flag.Parse()
 
-	http.HandleFunc("/data", dataHandler)
-	http.HandleFunc("/echo", echoHandler)
-	http.HandleFunc("/bench", benchHandler)
-	http.HandleFunc("/", whoamiHandler)
-	http.HandleFunc("/api", apiHandler)
-	http.HandleFunc("/health", healthHandler)
-
+	
+	sm := http.NewServeMux()
+	sm.HandleFunc("/data", dataHandler)
+	sm.HandleFunc("/echo", echoHandler)
+	sm.HandleFunc("/bench", benchHandler)
+	sm.HandleFunc("/", whoamiHandler)
+	sm.HandleFunc("/api", apiHandler)
+	sm.HandleFunc("/health", healthHandler)
+	srv := &http.Server{
+		Addr: ":80",
+		Handler: sm,
+	}
 	fmt.Println("Starting up on port " + port)
 
 	if len(cert) > 0 && len(key) > 0 {
 		log.Fatal(http.ListenAndServeTLS(":"+port, cert, key, nil))
 	}
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %s\n", err)
+		}
+	}()
+	fmt.Println("server started")
+	sigtermch := make(chan os.Signal)
+	signal.Notify(sigtermch, syscall.SIGTERM)
+	<-sigtermch
+	log.Println("received sigterm; waiting for grace period, then shutting down server")
+	time.Sleep(time.Duration(waitPeriodSeconds) * time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5 * time.Second)
+	defer func() {
+		cancel()
+	}()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server Shutdown Failed:%+v", err)
+	}
+	log.Print("Server Exited Properly")
 }
 
 func benchHandler(w http.ResponseWriter, _ *http.Request) {
